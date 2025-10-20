@@ -8,13 +8,21 @@ import logging
 import os
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass
 from random import Random
-from typing import Dict, Mapping, Optional, Protocol, Sequence
+from typing import Callable, Deque, Dict, List, Mapping, MutableMapping, Optional, Protocol, Sequence
 
-from ai import GreedyAIController, SnakeStrategy
-from config import AIPersonality, DEBUG_CONFIG, DISPLAY_CONFIG, GAME_CONFIG
-from engine import GameEvent, GameState, SnakeSpawn, advance_state, create_initial_state
+from config import AIPersonality, DebugConfig, DisplayConfig, GameConfig
+from engine import (
+    GameEvent,
+    GameState,
+    SnakeSpawn,
+    SnakeState,
+    TickResult,
+    advance_state,
+    create_initial_state,
+)
 from models import Direction, Position
 
 logger = logging.getLogger(__name__)
@@ -37,15 +45,40 @@ class DecisionProvider(Protocol):
         ...
 
 
+class SnakeController(Protocol):
+    """Controller that makes a decision for a specific snake."""
+
+    def decide(self, state: GameState, snake: SnakeState) -> Optional[Direction]:
+        ...
+
+
+class InputCommand(Protocol):
+    """Command abstraction for applying inputs to the decision buffer."""
+
+    def apply(self, decisions: MutableMapping[int, Direction]) -> None:
+        ...
+
+
+@dataclass(frozen=True)
+class MoveCommand(InputCommand):
+    """Concrete command that applies a move to a snake."""
+
+    snake_id: int
+    direction: Direction
+
+    def apply(self, decisions: MutableMapping[int, Direction]) -> None:
+        decisions[self.snake_id] = self.direction
+
+
 class InputProvider:
     """Base class for user input providers."""
 
-    def poll(self) -> Dict[int, Direction]:
+    def poll(self) -> Sequence[InputCommand]:
         """
-        Collect decisions for controllable snakes.
+        Collect commands for controllable snakes.
         Default implementation returns no overrides.
         """
-        return {}
+        return ()
 
     def close(self) -> None:
         """Hook for releasing terminal resources."""
@@ -64,20 +97,15 @@ class KeyboardInput(InputProvider):
         self._fd: Optional[int] = None
         self._tty_attrs = None
         if not self._is_windows:
-            import termios
-            import tty
+            self._setup_posix_terminal()
 
-            self._fd = sys.stdin.fileno()
-            self._tty_attrs = termios.tcgetattr(self._fd)
-            tty.setcbreak(self._fd)
-
-    def poll(self) -> Dict[int, Direction]:
-        decisions: Dict[int, Direction] = {}
+    def poll(self) -> Sequence[InputCommand]:
+        commands: list[InputCommand] = []
         if self._is_windows:
-            decisions.update(self._poll_windows())
+            commands.extend(self._poll_windows())
         else:
-            decisions.update(self._poll_posix())
-        return decisions
+            commands.extend(self._poll_posix())
+        return commands
 
     def close(self) -> None:
         if not self._is_windows and self._fd is not None and self._tty_attrs is not None:
@@ -93,12 +121,12 @@ class KeyboardInput(InputProvider):
             # Avoid raising during interpreter shutdown
             pass
 
-    def _poll_windows(self) -> Dict[int, Direction]:
-        decisions: Dict[int, Direction] = {}
+    def _poll_windows(self) -> List[InputCommand]:
+        commands: List[InputCommand] = []
         try:
             import msvcrt  # type: ignore
         except ImportError:
-            return decisions
+            return commands
 
         while msvcrt.kbhit():
             char = msvcrt.getwch()
@@ -107,11 +135,11 @@ class KeyboardInput(InputProvider):
             mapping = self._bindings.get(char.lower())
             if mapping:
                 snake_id, direction = mapping
-                decisions[snake_id] = direction
-        return decisions
+                commands.append(MoveCommand(snake_id, direction))
+        return commands
 
-    def _poll_posix(self) -> Dict[int, Direction]:
-        decisions: Dict[int, Direction] = {}
+    def _poll_posix(self) -> List[InputCommand]:
+        commands: List[InputCommand] = []
         import select
 
         while True:
@@ -124,19 +152,53 @@ class KeyboardInput(InputProvider):
             mapping = self._bindings.get(char.lower())
             if mapping:
                 snake_id, direction = mapping
-                decisions[snake_id] = direction
-        return decisions
+                commands.append(MoveCommand(snake_id, direction))
+        return commands
+
+    def _setup_posix_terminal(self) -> None:
+        if not sys.stdin.isatty():
+            return
+        try:
+            import termios
+            import tty
+
+            self._fd = sys.stdin.fileno()
+            self._tty_attrs = termios.tcgetattr(self._fd)
+            tty.setcbreak(self._fd)
+        except (termios.error, OSError, ValueError) as exc:  # pragma: no cover - platform specific
+            logger.debug("Terminal manipulation not available: %s", exc)
+            self._fd = None
+            self._tty_attrs = None
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("Unexpected terminal setup failure: %s", exc)
+            self._fd = None
+            self._tty_attrs = None
 
 
 class Renderer:
     """Base class for rendering game state."""
+
+    def __init__(
+        self,
+        display_config: DisplayConfig,
+        debug_config: DebugConfig,
+    ):
+        self._display_config = display_config
+        self._debug_config = debug_config
+
+    @property
+    def display_config(self) -> DisplayConfig:
+        return self._display_config
+
+    @property
+    def debug_config(self) -> DebugConfig:
+        return self._debug_config
 
     def render(
         self,
         state: GameState,
         profiles: Mapping[int, SnakeProfile],
         events: Sequence[GameEvent],
-        debug_enabled: bool,
     ) -> None:
         raise NotImplementedError
 
@@ -149,7 +211,6 @@ class AnsiRenderer(Renderer):
         state: GameState,
         profiles: Mapping[int, SnakeProfile],
         events: Sequence[GameEvent],
-        debug_enabled: bool,
     ) -> None:
         print("\033[2J\033[H", end="")  # clear screen
 
@@ -163,12 +224,23 @@ class AnsiRenderer(Renderer):
 
         print("\n" + "=" * state.width)
         self._print_status(state, profiles)
-        if events and DEBUG_CONFIG.LOG_DECISIONS:
+        if events and self.debug_config.LOG_DECISIONS:
             for event in events:
                 print(f"  • Event: {event.type} (snake={event.snake_id}, pos={event.position})")
 
-        if debug_enabled:
-            print(f"Debug Mode: danger_zones={DEBUG_CONFIG.SHOW_DANGER_ZONES}, paths={DEBUG_CONFIG.SHOW_PATHS}")
+        if any(
+            (
+                self.debug_config.SHOW_DANGER_ZONES,
+                self.debug_config.SHOW_PATHS,
+                self.debug_config.SHOW_EVALUATION_SCORES,
+            )
+        ):
+            print(
+                "Debug Mode: "
+                f"danger_zones={self.debug_config.SHOW_DANGER_ZONES}, "
+                f"paths={self.debug_config.SHOW_PATHS}, "
+                f"scores={self.debug_config.SHOW_EVALUATION_SCORES}"
+            )
 
         alive_count = sum(1 for snake in state.snakes if snake.alive)
         if alive_count <= 1:
@@ -181,10 +253,10 @@ class AnsiRenderer(Renderer):
             else:
                 print("All snakes eliminated!")
 
-        print(f"\nFrame: {state.frame}/{GAME_CONFIG.MAX_ROUNDS}")
+        print(f"\nFrame: {state.frame}")
 
     def _draw_border(self, grid: list[list[str]], width: int, height: int) -> None:
-        symbols = DISPLAY_CONFIG.SYMBOLS
+        symbols = self.display_config.SYMBOLS
         for x in range(width):
             grid[0][x] = symbols["border_h"]
             grid[height - 1][x] = symbols["border_h"]
@@ -200,9 +272,9 @@ class AnsiRenderer(Renderer):
         for food_pos in state.food:
             if 0 <= food_pos.y < state.height and 0 <= food_pos.x < state.width:
                 grid[food_pos.y][food_pos.x] = (
-                    f"{DISPLAY_CONFIG.COLORS['yellow']}"
-                    f"{DISPLAY_CONFIG.SYMBOLS['food']}"
-                    f"{DISPLAY_CONFIG.COLORS['reset']}"
+                    f"{self.display_config.COLORS['yellow']}"
+                    f"{self.display_config.SYMBOLS['food']}"
+                    f"{self.display_config.COLORS['reset']}"
                 )
 
     def _draw_snakes(
@@ -211,17 +283,17 @@ class AnsiRenderer(Renderer):
         state: GameState,
         profiles: Mapping[int, SnakeProfile],
     ) -> None:
-        body_symbol = DISPLAY_CONFIG.SYMBOLS["snake_body"]
+        body_symbol = self.display_config.SYMBOLS["snake_body"]
         for snake in state.snakes:
             profile = profiles.get(snake.id)
             if not profile:
                 continue
-            color = profile.color if snake.alive else DISPLAY_CONFIG.COLORS["gray"]
+            color = profile.color if snake.alive else self.display_config.COLORS["gray"]
             for index, segment in enumerate(snake.body):
                 if not (0 <= segment.x < state.width and 0 <= segment.y < state.height):
                     continue
                 symbol = profile.symbol if index == 0 else body_symbol
-                grid[segment.y][segment.x] = f"{color}{symbol}{DISPLAY_CONFIG.COLORS['reset']}"
+                grid[segment.y][segment.x] = f"{color}{symbol}{self.display_config.COLORS['reset']}"
 
     def _print_status(self, state: GameState, profiles: Mapping[int, SnakeProfile]) -> None:
         for snake in state.snakes:
@@ -229,13 +301,200 @@ class AnsiRenderer(Renderer):
             if not profile:
                 continue
             status = "ALIVE" if snake.alive else "DEAD"
-            color = profile.color if snake.alive else DISPLAY_CONFIG.COLORS["gray"]
+            color = profile.color if snake.alive else self.display_config.COLORS["gray"]
             personality_name = profile.personality.name
             print(
                 f"{color}{personality_name:11} Snake: {status:5} | "
                 f"Score: {snake.score:4} | Length: {snake.length():3} | "
-                f"Kills: {snake.kills}{DISPLAY_CONFIG.COLORS['reset']}"
+                f"Kills: {snake.kills}{self.display_config.COLORS['reset']}"
             )
+
+
+@dataclass(frozen=True)
+class StateMemento:
+    """Snapshot of a game state for replay/memento purposes."""
+
+    frame: int
+    state: GameState
+
+
+class StateHistory:
+    """Maintains a bounded history of game states for replay or debugging."""
+
+    def __init__(self, capacity: Optional[int] = None) -> None:
+        self._capacity = capacity
+        self._history: Deque[StateMemento] = deque()
+
+    def record(self, state: GameState) -> None:
+        self._history.append(StateMemento(frame=state.frame, state=state))
+        if self._capacity is not None and len(self._history) > self._capacity:
+            self._history.popleft()
+
+    def rewind(self, steps: int = 1) -> Optional[StateMemento]:
+        if steps <= 0 or steps > len(self._history):
+            return None
+        memento: Optional[StateMemento] = None
+        for _ in range(steps):
+            memento = self._history.pop()
+        assert memento is not None
+        return memento
+
+    def snapshots(self) -> Sequence[StateMemento]:
+        return tuple(self._history)
+
+
+class GameEventVisitor(Protocol):
+    """Visitor interface for processing game events."""
+
+    def visit(self, event: GameEvent) -> None:
+        ...
+
+
+class EventDispatcher:
+    """Coordinates event propagation via visitors and legacy listeners."""
+
+    def __init__(self) -> None:
+        self._listeners: list[Callable[[TickResult], None]] = []
+        self._visitors: list[GameEventVisitor] = []
+
+    def register_listener(self, listener: Callable[[TickResult], None]) -> None:
+        self._listeners.append(listener)
+
+    def register_visitor(self, visitor: GameEventVisitor) -> None:
+        self._visitors.append(visitor)
+
+    def dispatch(self, tick: TickResult) -> None:
+        for event in tick.events:
+            for visitor in self._visitors:
+                try:
+                    visitor.visit(event)
+                except Exception:
+                    logger.warning("Event visitor raised an exception", exc_info=True)
+
+        for listener in self._listeners:
+            try:
+                listener(tick)
+            except Exception:
+                logger.warning("Event listener raised an exception", exc_info=True)
+
+
+class DecisionCollector:
+    """Aggregates AI decisions, user commands, and controller overrides."""
+
+    def __init__(
+        self,
+        decision_provider: DecisionProvider,
+        input_provider: Optional[InputProvider],
+        overrides: Optional[Mapping[int, SnakeController]] = None,
+    ):
+        self._decision_provider = decision_provider
+        self._input_provider = input_provider
+        self._overrides: Dict[int, SnakeController] = dict(overrides or {})
+        self._command_history: list[list[InputCommand]] = []
+
+    def collect(self, state: GameState) -> Dict[int, Direction]:
+        decisions = dict(self._decision_provider.decide(state))
+        commands: list[InputCommand] = []
+
+        if self._input_provider is not None:
+            try:
+                commands.extend(self._input_provider.poll())
+            except OSError as exc:  # pragma: no cover - platform specific
+                logger.warning("Input provider failed: %s", exc)
+
+        commands.extend(self._collect_override_commands(state))
+
+        for command in commands:
+            command.apply(decisions)
+
+        self._command_history.append(commands)
+        return decisions
+
+    def update_override(self, snake_id: int, controller: SnakeController) -> None:
+        self._overrides[snake_id] = controller
+
+    def remove_override(self, snake_id: int) -> None:
+        self._overrides.pop(snake_id, None)
+
+    def history(self) -> Sequence[Sequence[InputCommand]]:
+        return tuple(tuple(cmds) for cmds in self._command_history)
+
+    def _collect_override_commands(self, state: GameState) -> list[InputCommand]:
+        commands: list[InputCommand] = []
+        snakes_by_id = {snake.id: snake for snake in state.snakes if snake.alive}
+        for snake_id, controller in self._overrides.items():
+            snake = snakes_by_id.get(snake_id)
+            if snake is None:
+                continue
+            override = controller.decide(state, snake)
+            if override is not None:
+                commands.append(MoveCommand(snake_id, override))
+        return commands
+
+
+class GameLoop:
+    """Runs the main simulation loop leveraging injected collaborators."""
+
+    def __init__(
+        self,
+        renderer: Renderer,
+        decision_collector: DecisionCollector,
+        event_dispatcher: EventDispatcher,
+        history: StateHistory,
+        rng: Random,
+        desired_food: int,
+        tick_interval: float,
+        max_rounds: int,
+        profiles: Mapping[int, SnakeProfile],
+        initial_state: GameState,
+    ):
+        self._renderer = renderer
+        self._decision_collector = decision_collector
+        self._event_dispatcher = event_dispatcher
+        self._history = history
+        self._rng = rng
+        self._desired_food = desired_food
+        self._tick_interval = tick_interval
+        self._max_rounds = max_rounds
+        self._profiles = profiles
+        self._state = initial_state
+        self._game_over = False
+
+    @property
+    def state(self) -> GameState:
+        return self._state
+
+    def run(self) -> GameState:
+        while not self._should_stop():
+            frame_start = time.perf_counter()
+            self._history.record(self._state)
+            decisions = self._decision_collector.collect(self._state)
+            tick = advance_state(self._state, decisions, self._rng, self._desired_food)
+            self._state = tick.state
+            self._history.record(self._state)
+            self._event_dispatcher.dispatch(tick)
+            self._renderer.render(tick.state, self._profiles, tick.events)
+            self._sleep_until_next_frame(frame_start)
+        return self._state
+
+    def _should_stop(self) -> bool:
+        if self._game_over:
+            return True
+        if self._state.frame >= self._max_rounds:
+            logger.info("Game over: reached max rounds (%s)", self._max_rounds)
+            return True
+        alive = [snake for snake in self._state.snakes if snake.alive]
+        if len(alive) <= 1:
+            logger.info("Game over: remaining snakes <= 1")
+            self._game_over = True
+            return True
+        return False
+
+    def _sleep_until_next_frame(self, frame_start: float) -> None:
+        elapsed = time.perf_counter() - frame_start
+        remaining = self._tick_interval - elapsed
+        if remaining > 0:
+            time.sleep(remaining)
 
 
 class GameRunner:
@@ -244,42 +503,73 @@ class GameRunner:
     def __init__(
         self,
         profiles: Sequence[SnakeProfile],
+        game_config: GameConfig,
+        display_config: DisplayConfig,
+        debug_config: DebugConfig,
+        ai_controller: DecisionProvider,
         renderer: Optional[Renderer] = None,
         input_provider: Optional[InputProvider] = None,
         rng: Optional[Random] = None,
         seed: Optional[int] = None,
         tick_interval: Optional[float] = None,
-        ai_controller: Optional[DecisionProvider] = None,
+        controller_overrides: Optional[Mapping[int, SnakeController]] = None,
+        event_listeners: Optional[Sequence[Callable[[TickResult], None]]] = None,
+        state_history_capacity: Optional[int] = None,
     ):
+        if renderer is None:
+            renderer = AnsiRenderer(display_config, debug_config)
+
         self._profiles = {profile.id: profile for profile in profiles}
-        self._renderer = renderer or AnsiRenderer()
+        self._renderer = renderer
         self._input = input_provider or InputProvider()
         if rng is not None:
             self._rng = rng
             self._seed = None
         else:
-            seed_value = seed if seed is not None else GAME_CONFIG.DEFAULT_SEED
+            seed_value = seed if seed is not None else game_config.DEFAULT_SEED
             self._rng = Random(seed_value)
             self._seed = seed_value
-        self._tick_interval = tick_interval if tick_interval is not None else GAME_CONFIG.TICK_INTERVAL
-        self._desired_food = GAME_CONFIG.INITIAL_FOOD_COUNT
-        self._max_rounds = GAME_CONFIG.MAX_ROUNDS
-        self._state = create_initial_state(
-            GAME_CONFIG.WIDTH,
-            GAME_CONFIG.HEIGHT,
-            self._default_spawns(),
-            GAME_CONFIG.INITIAL_FOOD_COUNT,
+
+        self._tick_interval = tick_interval if tick_interval is not None else game_config.TICK_INTERVAL
+        self._desired_food = game_config.INITIAL_FOOD_COUNT
+        self._game_config = game_config
+        self._debug_config = debug_config
+
+        initial_state = create_initial_state(
+            game_config.WIDTH,
+            game_config.HEIGHT,
+            self._default_spawns(game_config),
+            game_config.INITIAL_FOOD_COUNT,
             self._rng,
         )
-        self._game_over = False
-        strategies = {
-            profile.id: SnakeStrategy(profile.personality) for profile in profiles
-        }
-        self._ai: DecisionProvider = ai_controller or GreedyAIController(strategies)
+
+        self._history = StateHistory(capacity=state_history_capacity)
+        self._event_dispatcher = EventDispatcher()
+        for listener in event_listeners or ():
+            self._event_dispatcher.register_listener(listener)
+
+        self._decision_collector = DecisionCollector(
+            decision_provider=ai_controller,
+            input_provider=self._input,
+            overrides=controller_overrides,
+        )
+
+        self._loop = GameLoop(
+            renderer=self._renderer,
+            decision_collector=self._decision_collector,
+            event_dispatcher=self._event_dispatcher,
+            history=self._history,
+            rng=self._rng,
+            desired_food=self._desired_food,
+            tick_interval=self._tick_interval,
+            max_rounds=game_config.MAX_ROUNDS,
+            profiles=self._profiles,
+            initial_state=initial_state,
+        )
 
     @property
     def state(self) -> GameState:
-        return self._state
+        return self._loop.state
 
     @property
     def seed(self) -> Optional[int]:
@@ -289,45 +579,36 @@ class GameRunner:
     def profiles(self) -> Mapping[int, SnakeProfile]:
         return self._profiles
 
+    @property
+    def history(self) -> StateHistory:
+        return self._history
+
+    @property
+    def command_history(self) -> Sequence[Sequence[InputCommand]]:
+        return self._decision_collector.history()
+
     def run(self) -> None:
         """Run until completion or interruption."""
-        debug_enabled = DEBUG_CONFIG.SHOW_DANGER_ZONES or DEBUG_CONFIG.SHOW_PATHS
         try:
-            while not self._game_over and self._state.frame < self._max_rounds:
-                frame_start = time.perf_counter()
-                decisions = self._collect_decisions()
-                tick = advance_state(self._state, decisions, self._rng, self._desired_food)
-                self._apply_tick(tick, debug_enabled)
-                self._game_over = self._evaluate_game_over()
-                self._sleep_until_next_frame(frame_start)
+            self._loop.run()
         finally:
-            self._renderer.render(self._state, self._profiles, (), debug_enabled)
+            # Ensure the final state is rendered at least once without events.
+            self._renderer.render(self.state, self._profiles, ())
             self._input.close()
 
-    def _collect_decisions(self) -> Dict[int, Direction]:
-        automated = dict(self._ai.decide(self._state))
-        manual = self._input.poll()
-        automated.update(manual)
-        return automated
+    def add_controller_override(self, snake_id: int, controller: SnakeController) -> None:
+        self._decision_collector.update_override(snake_id, controller)
 
-    def _apply_tick(self, tick: TickResult, debug_enabled: bool) -> None:
-        self._state = tick.state
-        self._renderer.render(tick.state, self._profiles, tick.events, debug_enabled)
+    def remove_controller_override(self, snake_id: int) -> None:
+        self._decision_collector.remove_override(snake_id)
 
-    def _sleep_until_next_frame(self, frame_start: float) -> None:
-        elapsed = time.perf_counter() - frame_start
-        remaining = self._tick_interval - elapsed
-        if remaining > 0:
-            time.sleep(remaining)
+    def add_event_listener(self, listener: Callable[[TickResult], None]) -> None:
+        self._event_dispatcher.register_listener(listener)
 
-    def _evaluate_game_over(self) -> bool:
-        alive = [snake for snake in self._state.snakes if snake.alive]
-        if len(alive) <= 1:
-            logger.info("Game over due to remaining snakes <= 1")
-            return True
-        return False
+    def add_event_visitor(self, visitor: GameEventVisitor) -> None:
+        self._event_dispatcher.register_visitor(visitor)
 
-    def _default_spawns(self) -> Sequence[SnakeSpawn]:
+    def _default_spawns(self, game_config: GameConfig) -> Sequence[SnakeSpawn]:
         """Initial spawn configuration for the default three snakes."""
         return (
             SnakeSpawn(
@@ -337,12 +618,12 @@ class GameRunner:
             ),
             SnakeSpawn(
                 id=1,
-                body=(Position(GAME_CONFIG.WIDTH - 10, 10),),
+                body=(Position(game_config.WIDTH - 10, 10),),
                 direction=Direction.LEFT,
             ),
             SnakeSpawn(
                 id=2,
-                body=(Position(GAME_CONFIG.WIDTH // 2, 5),),
+                body=(Position(game_config.WIDTH // 2, 5),),
                 direction=Direction.DOWN,
             ),
         )

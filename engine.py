@@ -107,27 +107,18 @@ def create_initial_state(
     return GameState(snakes=snakes, food=food, occupied=occupied, width=width, height=height)
 
 
-def advance_state(
-    state: GameState,
-    decisions: Mapping[int, Direction],
-    rng: Random,
-    desired_food: int,
-) -> TickResult:
-    """
-    Advance the game by one frame.
-
-    Decisions map snake id to desired direction. If a decision is the direct
-    opposite of the current direction it is ignored.
-    """
+def _movement_phase(
+    state: GameState, 
+    decisions: Mapping[int, Direction]
+) -> tuple[list[SnakeState], set[Position], list[GameEvent]]:
+    """Move all snakes according to decisions, handling food consumption."""
     moved = []
     food = set(state.food)
     generated_events: list[GameEvent] = []
 
     for snake in state.snakes:
         if not snake.alive:
-            moved.append(
-                snake  # dead snakes persist as corpses but removed from occupancy later
-            )
+            moved.append(snake)  # dead snakes persist as corpses
             continue
 
         direction = decisions.get(snake.id, snake.direction)
@@ -158,11 +149,16 @@ def advance_state(
             )
         )
 
-    # Collision phase
-    alive_flags: Dict[int, bool] = {snake.id: snake.alive for snake in moved}
-    lengths: Dict[int, int] = {snake.id: snake.length() for snake in moved}
+    return moved, food, generated_events
 
-    # Wall / self collisions
+
+def _wall_collision_phase(
+    state: GameState, 
+    moved: list[SnakeState], 
+    alive_flags: Dict[int, bool], 
+    generated_events: list[GameEvent]
+) -> None:
+    """Check for wall and self-collisions."""
     for snake in moved:
         if not snake.alive:
             alive_flags[snake.id] = False
@@ -180,7 +176,14 @@ def advance_state(
                 GameEvent(type="snake_died", snake_id=snake.id, position=head)
             )
 
-    # Head-to-head collisions
+
+def _head_collision_phase(
+    moved: list[SnakeState], 
+    alive_flags: Dict[int, bool], 
+    lengths: Dict[int, int], 
+    generated_events: list[GameEvent]
+) -> list[SnakeState]:
+    """Handle head-to-head collisions between snakes."""
     head_positions: Dict[Position, list] = {}
     for snake in moved:
         if not alive_flags.get(snake.id, False):
@@ -209,7 +212,7 @@ def advance_state(
                         GameEvent(type="snake_died", snake_id=snake_id, position=position)
                     )
             if win_count > 0:
-                _award_kill(moved, winner, win_count)
+                moved = _award_kill(moved, winner, win_count)
         else:
             for snake_id in contenders:
                 if alive_flags.get(snake_id, False):
@@ -218,7 +221,15 @@ def advance_state(
                         GameEvent(type="snake_died", snake_id=snake_id, position=position)
                     )
 
-    # Head into another body
+    return moved
+
+
+def _body_collision_phase(
+    moved: list[SnakeState], 
+    alive_flags: Dict[int, bool], 
+    generated_events: list[GameEvent]
+) -> list[SnakeState]:
+    """Handle collisions with other snakes' bodies."""
     body_positions: Dict[Position, int] = {}
     for snake in moved:
         if not alive_flags.get(snake.id, False):
@@ -236,9 +247,13 @@ def advance_state(
             generated_events.append(
                 GameEvent(type="snake_died", snake_id=snake.id, position=head)
             )
-            _award_kill(moved, occupant, 1)
+            moved = _award_kill(moved, occupant, 1)
 
-    # Apply death flags to moved snakes
+    return moved
+
+
+def _apply_death_flags(moved: list[SnakeState], alive_flags: Dict[int, bool]) -> list[SnakeState]:
+    """Apply death flags to create final snake states."""
     next_snakes = []
     for snake in moved:
         is_alive = alive_flags.get(snake.id, False) and snake.alive
@@ -255,10 +270,43 @@ def advance_state(
             )
         else:
             next_snakes.append(snake)
+    return next_snakes
 
+
+def advance_state(
+    state: GameState,
+    decisions: Mapping[int, Direction],
+    rng: Random,
+    desired_food: int,
+) -> TickResult:
+    """
+    Advance the game by one frame.
+
+    Decisions map snake id to desired direction. If a decision is the direct
+    opposite of the current direction it is ignored.
+    """
+    # Phase 1: Movement and food consumption
+    moved, food, generated_events = _movement_phase(state, decisions)
+    
+    # Phase 2: Collision detection setup
+    alive_flags: Dict[int, bool] = {snake.id: snake.alive for snake in moved}
+    lengths: Dict[int, int] = {snake.id: snake.length() for snake in moved}
+    
+    # Phase 3: Wall and self collisions
+    _wall_collision_phase(state, moved, alive_flags, generated_events)
+    
+    # Phase 4: Head-to-head collisions
+    moved = _head_collision_phase(moved, alive_flags, lengths, generated_events)
+    
+    # Phase 5: Body collisions
+    moved = _body_collision_phase(moved, alive_flags, generated_events)
+    
+    # Phase 6: Apply death flags
+    next_snakes = _apply_death_flags(moved, alive_flags)
+    
+    # Phase 7: Food respawn and final state
     alive_snakes = tuple(s for s in next_snakes if s.alive)
-
-    # Respawn food if needed
+    
     if len(food) < desired_food:
         food = _spawn_food(
             state.width,
@@ -314,15 +362,16 @@ def _is_within_bounds(pos: Position, width: int, height: int) -> bool:
     return 0 < pos.x < width - 1 and 0 < pos.y < height - 1
 
 
-def _award_kill(snakes: Sequence[SnakeState], killer_id: int, kills: int) -> None:
-    for index, snake in enumerate(snakes):
-        if snake.id == killer_id:
-            snakes[index] = SnakeState(
-                id=snake.id,
-                body=snake.body,
-                direction=snake.direction,
-                alive=snake.alive,
-                score=snake.score,
-                kills=snake.kills + kills,
-            )
-            break
+def _award_kill(snakes: Sequence[SnakeState], killer_id: int, kills: int) -> Sequence[SnakeState]:
+    """Award kills to the specified snake, returning a new sequence."""
+    return tuple(
+        SnakeState(
+            id=snake.id,
+            body=snake.body,
+            direction=snake.direction,
+            alive=snake.alive,
+            score=snake.score,
+            kills=snake.kills + kills,
+        ) if snake.id == killer_id else snake
+        for snake in snakes
+    )
