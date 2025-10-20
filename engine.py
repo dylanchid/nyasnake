@@ -280,8 +280,7 @@ def advance_state(
         height=state.height,
         frame=state.frame + 1,
     )
-    if generated_events:
-        events = tuple(generated_events)
+    events = tuple(generated_events)
     return TickResult(state=next_state, events=events)
 
 

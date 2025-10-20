@@ -24,15 +24,16 @@ def find_path(
     if start == goal:
         return []
 
-    open_heap: List[Tuple[int, int, Position]] = []
-    heapq.heappush(open_heap, (_heuristic(start, goal), 0, start))
+    open_heap: List[Tuple[int, int, int, Position]] = []
+    counter = 0
+    heapq.heappush(open_heap, (_heuristic(start, goal), counter, 0, start))
 
     came_from: Dict[Position, Position] = {}
     g_score: Dict[Position, int] = {start: 0}
     visited: Set[Position] = set()
 
     while open_heap:
-        _, distance, current = heapq.heappop(open_heap)
+        _, _, distance, current = heapq.heappop(open_heap)
         if current in visited:
             continue
         visited.add(current)
@@ -46,7 +47,8 @@ def find_path(
                 came_from[neighbor] = current
                 g_score[neighbor] = tentative
                 priority = tentative + _heuristic(neighbor, goal)
-                heapq.heappush(open_heap, (priority, tentative, neighbor))
+                counter += 1
+                heapq.heappush(open_heap, (priority, counter, tentative, neighbor))
 
     return None
 

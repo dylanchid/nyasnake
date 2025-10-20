@@ -247,14 +247,21 @@ class GameRunner:
         renderer: Optional[Renderer] = None,
         input_provider: Optional[InputProvider] = None,
         rng: Optional[Random] = None,
+        seed: Optional[int] = None,
+        tick_interval: Optional[float] = None,
         ai_controller: Optional[DecisionProvider] = None,
     ):
         self._profiles = {profile.id: profile for profile in profiles}
         self._renderer = renderer or AnsiRenderer()
         self._input = input_provider or InputProvider()
-        self._rng = rng or Random()
-        base_interval = tick_interval if tick_interval is not None else GAME_CONFIG.TICK_INTERVAL
-        self._tick_interval = base_interval
+        if rng is not None:
+            self._rng = rng
+            self._seed = None
+        else:
+            seed_value = seed if seed is not None else GAME_CONFIG.DEFAULT_SEED
+            self._rng = Random(seed_value)
+            self._seed = seed_value
+        self._tick_interval = tick_interval if tick_interval is not None else GAME_CONFIG.TICK_INTERVAL
         self._desired_food = GAME_CONFIG.INITIAL_FOOD_COUNT
         self._max_rounds = GAME_CONFIG.MAX_ROUNDS
         self._state = create_initial_state(
@@ -273,6 +280,14 @@ class GameRunner:
     @property
     def state(self) -> GameState:
         return self._state
+
+    @property
+    def seed(self) -> Optional[int]:
+        return self._seed
+
+    @property
+    def profiles(self) -> Mapping[int, SnakeProfile]:
+        return self._profiles
 
     def run(self) -> None:
         """Run until completion or interruption."""
