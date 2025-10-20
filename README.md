@@ -21,16 +21,71 @@ pytest -q
 ## Command-Line Options
 
 ```
-usage: main.py [-h] [--seed SEED] [--tick-interval SECONDS] [--tick-rate FPS]
-               [--ai-level {easy,normal,hard}] [--interactive]
-               [--log-level {DEBUG,INFO,WARNING,ERROR}] [--debug]
+usage: main.py [-h] [--seed SEED] [--tick-interval TICK_INTERVAL]
+               [--tick-rate TICK_RATE] [--ai-level {easy,normal,hard}]
+               [--interactive] [--log-level {DEBUG,INFO,WARNING,ERROR}]
+               [--debug] [--width WIDTH] [--height HEIGHT]
+               [--food-count FOOD_COUNT] [--max-rounds MAX_ROUNDS]
+               [--difficulty {easy,normal,hard,extreme,custom}] [--speed-ramp]
+               [--ramp-interval RAMP_INTERVAL] [--ramp-step RAMP_STEP]
+               [--min-tick MIN_TICK]
 ```
 
-- `--seed`: deterministic random seed (defaults to `config.GAME_CONFIG.DEFAULT_SEED`).
+### Core Options
+
+- `--seed`: deterministic random seed (defaults to `1337`).
 - `--tick-interval` / `--tick-rate`: control simulation cadence in seconds or frames per second.
-- `--ai-level`: selects controller presets (`easy`=all defensive, `normal`=profile defaults, `hard`=all aggressive).
+- `--ai-level`: selects AI controller presets (`easy`=all defensive, `normal`=profile defaults, `hard`=all aggressive).
 - `--interactive`: enable WASD controls for snake `0`, powered by the non-blocking keyboard adapter.
 - `--debug`: toggles debug overlays (currently traces spawn and path markers).
+
+### Game Configuration
+
+- `--width`: grid width (default: 60, range: 20-200).
+- `--height`: grid height (default: 20, range: 20-200).
+- `--food-count`: initial food count (default: 5, range: 1-50).
+- `--max-rounds`: maximum number of rounds before game ends (default: 800).
+
+### Difficulty Presets
+
+- `--difficulty {easy,normal,hard,extreme,custom}`: apply bundled difficulty settings. Use `custom` (default) for manual configuration.
+  - **easy**: Smaller grid (40x20), more food (8), slower speed (0.15s), no ramping
+  - **normal**: Standard grid (60x20), balanced food (5), moderate speed (0.12s), no ramping
+  - **hard**: Larger grid (80x30), less food (4), faster speed (0.10s), speed ramping enabled
+  - **extreme**: Huge grid (100x40), minimal food (3), very fast (0.08s), aggressive speed ramping
+
+### Speed Ramping
+
+Progressive speed increases add an escalating challenge as the game continues:
+
+- `--speed-ramp`: enable progressive speed increases during gameplay.
+- `--ramp-interval`: frames between speed increases (default: 100).
+- `--ramp-step`: tick interval reduction per ramp in seconds (default: 0.01).
+- `--min-tick`: minimum tick interval / maximum speed cap (default: 0.03).
+
+**Example**: With `--speed-ramp --ramp-interval 100 --ramp-step 0.01 --min-tick 0.03`, the game starts at the initial tick interval and reduces by 0.01s every 100 frames until reaching 0.03s (max speed).
+
+### Usage Examples
+
+```bash
+# Run with default settings
+python main.py
+
+# Easy difficulty preset with custom seed
+python main.py --difficulty easy --seed 42
+
+# Custom grid size with speed ramping
+python main.py --width 80 --height 40 --speed-ramp
+
+# Hard preset with interactive controls
+python main.py --difficulty hard --interactive
+
+# Extreme challenge: maximum grid, minimal food, aggressive ramping
+python main.py --difficulty extreme
+
+# Custom configuration: large grid, lots of food, gentle ramping
+python main.py --width 100 --height 50 --food-count 15 --speed-ramp --ramp-interval 200 --ramp-step 0.005
+```
 
 ## Project Layout
 

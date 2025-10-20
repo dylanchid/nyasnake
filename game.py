@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from random import Random
 from typing import Callable, Deque, Dict, List, Mapping, MutableMapping, Optional, Protocol, Sequence
 
-from config import AIPersonality, DebugConfig, DisplayConfig, GameConfig
+from config import AIPersonality, DebugConfig, DisplayConfig, GameConfig, SpeedRampConfig
 from engine import (
     GameEvent,
     GameState,
@@ -447,6 +447,7 @@ class GameLoop:
         max_rounds: int,
         profiles: Mapping[int, SnakeProfile],
         initial_state: GameState,
+        speed_ramp_config: Optional[SpeedRampConfig] = None,
     ):
         self._renderer = renderer
         self._decision_collector = decision_collector
@@ -454,15 +455,23 @@ class GameLoop:
         self._history = history
         self._rng = rng
         self._desired_food = desired_food
-        self._tick_interval = tick_interval
+        self._initial_tick_interval = tick_interval
+        self._current_tick_interval = tick_interval
         self._max_rounds = max_rounds
         self._profiles = profiles
         self._state = initial_state
         self._game_over = False
+        self._speed_ramp_config = speed_ramp_config
+        self._frames_since_last_ramp = 0
 
     @property
     def state(self) -> GameState:
         return self._state
+
+    @property
+    def current_tick_interval(self) -> float:
+        """Return the current tick interval (may differ from initial if ramping)."""
+        return self._current_tick_interval
 
     def run(self) -> GameState:
         while not self._should_stop():
@@ -474,6 +483,7 @@ class GameLoop:
             self._history.record(self._state)
             self._event_dispatcher.dispatch(tick)
             self._renderer.render(tick.state, self._profiles, tick.events)
+            self._apply_speed_ramping()
             self._sleep_until_next_frame(frame_start)
         return self._state
 
@@ -490,9 +500,39 @@ class GameLoop:
             return True
         return False
 
+    def _apply_speed_ramping(self) -> None:
+        """Apply speed ramping if configured and conditions are met."""
+        if not self._speed_ramp_config or not self._speed_ramp_config.enabled:
+            return
+        
+        self._frames_since_last_ramp += 1
+        
+        if self._frames_since_last_ramp >= self._speed_ramp_config.ramp_interval:
+            # Time to ramp up the speed
+            new_interval = self._current_tick_interval - self._speed_ramp_config.ramp_step
+            # Respect the minimum tick interval (max speed)
+            if new_interval >= self._speed_ramp_config.min_tick_interval:
+                self._current_tick_interval = new_interval
+                logger.info(
+                    "Speed ramped: tick_interval %.3f -> %.3f (frame %d)",
+                    self._current_tick_interval + self._speed_ramp_config.ramp_step,
+                    self._current_tick_interval,
+                    self._state.frame,
+                )
+            else:
+                # Hit the speed cap
+                if self._current_tick_interval > self._speed_ramp_config.min_tick_interval:
+                    self._current_tick_interval = self._speed_ramp_config.min_tick_interval
+                    logger.info(
+                        "Speed cap reached: tick_interval %.3f (frame %d)",
+                        self._current_tick_interval,
+                        self._state.frame,
+                    )
+            self._frames_since_last_ramp = 0
+
     def _sleep_until_next_frame(self, frame_start: float) -> None:
         elapsed = time.perf_counter() - frame_start
-        remaining = self._tick_interval - elapsed
+        remaining = self._current_tick_interval - elapsed
         if remaining > 0:
             time.sleep(remaining)
 
@@ -512,6 +552,7 @@ class GameRunner:
         rng: Optional[Random] = None,
         seed: Optional[int] = None,
         tick_interval: Optional[float] = None,
+        speed_ramp_config: Optional[SpeedRampConfig] = None,
         controller_overrides: Optional[Mapping[int, SnakeController]] = None,
         event_listeners: Optional[Sequence[Callable[[TickResult], None]]] = None,
         state_history_capacity: Optional[int] = None,
@@ -565,6 +606,7 @@ class GameRunner:
             max_rounds=game_config.MAX_ROUNDS,
             profiles=self._profiles,
             initial_state=initial_state,
+            speed_ramp_config=speed_ramp_config,
         )
 
     @property

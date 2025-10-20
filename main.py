@@ -15,6 +15,8 @@ from config import (
     DebugConfig,
     DisplayConfig,
     GameConfig,
+    GameOptions,
+    SpeedRampConfig,
     get_default_ai_config,
     get_default_debug_config,
     get_default_display_config,
@@ -35,7 +37,10 @@ def setup_logging(log_level: str) -> None:
 
 def parse_args() -> argparse.Namespace:
     default_debug = get_default_debug_config()
+    default_game = get_default_game_config()
     parser = argparse.ArgumentParser(description="Nyasnake arena")
+    
+    # Existing flags (backward compatibility)
     parser.add_argument("--seed", type=int, help="Seed RNG for reproducible simulations.")
     parser.add_argument("--tick-interval", type=float, help="Seconds between frames.")
     parser.add_argument("--tick-rate", type=float, help="Frames per second. Overrides tick-interval if provided.")
@@ -43,6 +48,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--interactive", action="store_true", help="Enable keyboard controls for snake 0 (WASD).")
     parser.add_argument("--log-level", default=default_debug.LOG_LEVEL, choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     parser.add_argument("--debug", action="store_true", help="Enable debug overlays while rendering.")
+    
+    # New configuration flags
+    parser.add_argument("--width", type=int, help=f"Grid width (default: {default_game.WIDTH}, range: {default_game.MIN_GRID_SIZE}-{default_game.MAX_GRID_SIZE}).")
+    parser.add_argument("--height", type=int, help=f"Grid height (default: {default_game.HEIGHT}, range: {default_game.MIN_GRID_SIZE}-{default_game.MAX_GRID_SIZE}).")
+    parser.add_argument("--food-count", type=int, help=f"Initial food count (default: {default_game.INITIAL_FOOD_COUNT}, range: {default_game.MIN_FOOD_COUNT}-{default_game.MAX_FOOD_COUNT}).")
+    parser.add_argument("--max-rounds", type=int, help=f"Maximum number of rounds (default: {default_game.MAX_ROUNDS}).")
+    
+    # Difficulty preset flag
+    parser.add_argument(
+        "--difficulty",
+        choices=["easy", "normal", "hard", "extreme", "custom"],
+        default="custom",
+        help="Difficulty preset (bundled settings for grid, speed, food). Use 'custom' for manual configuration."
+    )
+    
+    # Speed ramping flags
+    parser.add_argument("--speed-ramp", action="store_true", help="Enable progressive speed increases during gameplay.")
+    parser.add_argument("--ramp-interval", type=int, default=100, help="Frames between speed increases (default: 100).")
+    parser.add_argument("--ramp-step", type=float, default=0.01, help="Tick interval reduction per ramp in seconds (default: 0.01).")
+    parser.add_argument("--min-tick", type=float, default=0.03, help="Minimum tick interval / maximum speed cap (default: 0.03).")
+    
     return parser.parse_args()
 
 
@@ -96,24 +122,110 @@ def configure_debug(debug_enabled: bool, log_level: str) -> DebugConfig:
     )
 
 
+def get_difficulty_preset(difficulty: str) -> dict:
+    """Return preset configuration values for each difficulty level."""
+    presets = {
+        "easy": {
+            "grid_width": 40,
+            "grid_height": 20,
+            "initial_food_count": 8,
+            "tick_interval": 0.15,
+            "max_rounds": 600,
+            "speed_ramp_enabled": False,
+        },
+        "normal": {
+            "grid_width": 60,
+            "grid_height": 20,
+            "initial_food_count": 5,
+            "tick_interval": 0.12,
+            "max_rounds": 800,
+            "speed_ramp_enabled": False,
+        },
+        "hard": {
+            "grid_width": 80,
+            "grid_height": 30,
+            "initial_food_count": 4,
+            "tick_interval": 0.10,
+            "max_rounds": 1000,
+            "speed_ramp_enabled": True,
+            "ramp_interval": 150,
+            "ramp_step": 0.01,
+            "min_tick_interval": 0.04,
+        },
+        "extreme": {
+            "grid_width": 100,
+            "grid_height": 40,
+            "initial_food_count": 3,
+            "tick_interval": 0.08,
+            "max_rounds": 1500,
+            "speed_ramp_enabled": True,
+            "ramp_interval": 100,
+            "ramp_step": 0.015,
+            "min_tick_interval": 0.02,
+        },
+    }
+    return presets.get(difficulty, {})
+
+
+def build_game_options(args: argparse.Namespace) -> GameOptions:
+    """Construct GameOptions from CLI arguments, applying presets as needed."""
+    default_game = get_default_game_config()
+    
+    # Start with difficulty preset if not custom
+    if args.difficulty != "custom":
+        preset = get_difficulty_preset(args.difficulty)
+    else:
+        preset = {}
+    
+    # CLI args override preset values
+    grid_width = args.width if args.width is not None else preset.get("grid_width", default_game.WIDTH)
+    grid_height = args.height if args.height is not None else preset.get("grid_height", default_game.HEIGHT)
+    initial_food_count = args.food_count if args.food_count is not None else preset.get("initial_food_count", default_game.INITIAL_FOOD_COUNT)
+    max_rounds = args.max_rounds if args.max_rounds is not None else preset.get("max_rounds", default_game.MAX_ROUNDS)
+    
+    # Determine tick interval (backward compatibility with --tick-rate and --tick-interval)
+    tick_interval = preset.get("tick_interval", default_game.TICK_INTERVAL)
+    if args.tick_rate:
+        tick_interval = 1.0 / max(args.tick_rate, 1e-3)
+    elif args.tick_interval is not None:
+        tick_interval = args.tick_interval
+    
+    # Speed ramping configuration
+    speed_ramp_enabled = args.speed_ramp or preset.get("speed_ramp_enabled", False)
+    speed_ramp_config = None
+    if speed_ramp_enabled:
+        speed_ramp_config = SpeedRampConfig(
+            enabled=True,
+            ramp_interval=preset.get("ramp_interval", args.ramp_interval),
+            ramp_step=preset.get("ramp_step", args.ramp_step),
+            min_tick_interval=preset.get("min_tick_interval", args.min_tick),
+        )
+    
+    return GameOptions(
+        grid_width=grid_width,
+        grid_height=grid_height,
+        initial_food_count=initial_food_count,
+        tick_interval=tick_interval,
+        max_rounds=max_rounds,
+        speed_ramp_config=speed_ramp_config,
+    )
+
+
 def main() -> None:
     args = parse_args()
     setup_logging(args.log_level)
     
-    # Create config instances (no global singletons!)
-    game_config = get_default_game_config()
+    # Build game options from CLI args (with preset support)
+    game_options = build_game_options(args)
+    game_config = game_options.build_game_config()
+    
+    # Create other config instances (no global singletons!)
     display_config = get_default_display_config()
     ai_config = get_default_ai_config()
     debug_config = configure_debug(args.debug, args.log_level)
 
     logger = logging.getLogger("nyasnake")
     logger.info("Starting Nyasnake")
-
-    tick_interval = args.tick_interval
-    if args.tick_rate:
-        tick_interval = 1.0 / max(args.tick_rate, 1e-3)
-    if tick_interval is None:
-        tick_interval = game_config.TICK_INTERVAL
 
     profiles = build_profiles(display_config)
     input_provider = create_input_provider(args.interactive)
@@ -126,7 +238,8 @@ def main() -> None:
         profiles=profiles,
         input_provider=input_provider,
         seed=args.seed,
-        tick_interval=tick_interval,
+        tick_interval=game_options.tick_interval,
+        speed_ramp_config=game_options.speed_ramp_config,
         game_config=game_config,
         display_config=display_config,
         debug_config=debug_config,
@@ -134,11 +247,29 @@ def main() -> None:
         renderer=renderer,
     )
 
+    # Enhanced startup banner
     banner = "=" * game_config.WIDTH
     print(banner)
     print("🐍  Nyasnake Arena")
     print(banner)
-    print(f"Snakes: {len(profiles)} | Tick interval: {tick_interval:.3f}s | Seed: {args.seed or runner.seed}")
+    
+    # Show difficulty preset if used
+    if args.difficulty != "custom":
+        print(f"Difficulty: {args.difficulty.upper()}")
+    
+    # Show configuration details
+    print(f"Grid: {game_config.WIDTH}x{game_config.HEIGHT}")
+    print(f"Snakes: {len(profiles)} | Food: {game_config.INITIAL_FOOD_COUNT} | Max rounds: {game_config.MAX_ROUNDS}")
+    print(f"Initial speed: {game_options.tick_interval:.3f}s/tick", end="")
+    
+    # Show speed ramping info if enabled
+    if game_options.speed_ramp_config and game_options.speed_ramp_config.enabled:
+        ramp = game_options.speed_ramp_config
+        print(f" → {ramp.min_tick_interval:.3f}s (ramps every {ramp.ramp_interval} frames)")
+    else:
+        print()
+    
+    print(f"Seed: {args.seed or runner.seed} | AI Level: {args.ai_level}")
     print("Press Ctrl+C to exit.\n")
 
     try:
